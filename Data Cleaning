@@ -1,0 +1,197 @@
+import pandas as pd
+from azure.storage.blob import BlobServiceClient
+import io
+import os
+from datetime import datetime, timezone
+
+# Azure Storage account credentials
+connection_string = "YOUR_CONNECTION_STRING"  # Replace with your actual connection string
+container_name = "raw"
+
+# Initialize the BlobServiceClient
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+
+# Function to parse the raw file content based on the file type
+def parse_data(file_type, data):
+    """Parses raw data based on file type (CSV, JSON, etc.)."""
+    if file_type == "CSV":
+        return pd.read_csv(io.BytesIO(data))
+    elif file_type == "JSON":
+        return pd.read_json(io.BytesIO(data))
+    else:
+        raise ValueError(f"Unsupported file type: {file_type}")
+
+# Function to get the latest file based on the filename timestamp
+def get_latest_file(folder_name, file_type):
+    """
+    Retrieve the latest file from the folder based on the timestamp in the filename.
+    Expected format: <file_type>YYYYMMDD_HHMMSS.csv (e.g., Customers20250122_090317.csv)
+    """
+    blobs = blob_service_client.get_container_client(container=container_name).list_blobs(name_starts_with=folder_name)
+
+    latest_blob = None
+    latest_timestamp = None
+
+    for blob in blobs:
+        blob_name = blob.name
+        file_name = os.path.basename(blob_name)  # Extract only the file name
+        if file_type in file_name and file_name.endswith(".csv"):
+            try:
+                # Extract the timestamp part of the filename
+                timestamp_str = file_name.split(file_type)[-1].split(".csv")[0].lstrip("_")
+                if timestamp_str:  # Ensure timestamp exists
+                    timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+
+                    # Compare and find the latest timestamp
+                    if latest_timestamp is None or timestamp > latest_timestamp:
+                        latest_blob = blob_name
+                        latest_timestamp = timestamp
+            except ValueError as ve:
+                print(f"Skipping blob '{blob_name}': Invalid timestamp format. Error: {ve}")
+            except Exception as e:
+                print(f"Unexpected error while parsing blob '{blob_name}': {e}")
+
+    if latest_blob is None:
+        raise FileNotFoundError(f"No valid files found for {file_type} in {folder_name}")
+
+    return latest_blob, latest_timestamp
+
+# Function to clean data based on file type and apply CDC
+def clean_data(file_type, blob_name, last_processed_timestamp=None):
+    # Initialize the BlobServiceClient
+    blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+    # Read the file from Azure Data Lake Storage
+    downloaded_blob = blob_client.download_blob()
+    data = downloaded_blob.readall()
+
+    # Parse the data (CSV, JSON, etc.)
+    df = parse_data("CSV", data)
+
+    # Create a copy of the original data for tracking removed data
+    original_data = df.copy()
+
+    # Initialize invalid data variables
+    invalid_dates = pd.DataFrame()
+    invalid_numeric = pd.DataFrame()
+
+    if file_type == "Products":
+        cleaned_data = df.dropna()
+        removed_nulls = original_data[~original_data.index.isin(cleaned_data.index)]
+        cleaned_data = cleaned_data.drop_duplicates(subset="ProductID", keep="first")
+        removed_duplicates = original_data[~original_data.index.isin(cleaned_data.index)]
+        try:
+            cleaned_data['LastUpdated'] = pd.to_datetime(cleaned_data['LastUpdated'], errors='coerce')
+            invalid_dates = cleaned_data[cleaned_data['LastUpdated'].isna()]
+            cleaned_data = cleaned_data.dropna(subset=['LastUpdated'])
+            cleaned_data['LastUpdated'] = cleaned_data['LastUpdated'].dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            print(f"Error in date conversion: {e}")
+        cleaned_data['ProductID'] = pd.to_numeric(cleaned_data['ProductID'], errors='coerce')
+        cleaned_data['StockLevel'] = pd.to_numeric(cleaned_data['StockLevel'], errors='coerce')
+        invalid_numeric = cleaned_data[cleaned_data[['ProductID', 'StockLevel']].isna()]
+        cleaned_data = cleaned_data.dropna(subset=['ProductID', 'StockLevel'])
+        cleaned_data['ProductID'] = cleaned_data['ProductID'].astype(int)
+        cleaned_data['StockLevel'] = cleaned_data['StockLevel'].astype(int)
+
+        # Apply CDC: Only keep rows updated after last_processed_timestamp
+        if last_processed_timestamp and isinstance(last_processed_timestamp, datetime):
+            cleaned_data = cleaned_data[cleaned_data['LastUpdated'] > last_processed_timestamp]
+
+    elif file_type == "Orders":
+        cleaned_data = df.dropna()
+        removed_nulls = original_data[~original_data.index.isin(cleaned_data.index)]
+        cleaned_data = cleaned_data.drop_duplicates(subset="OrderID", keep="first")
+        removed_duplicates = original_data[~original_data.index.isin(cleaned_data.index)]
+        try:
+            cleaned_data['OrderDate'] = pd.to_datetime(cleaned_data['OrderDate'], errors='coerce')
+            invalid_dates = cleaned_data[cleaned_data['OrderDate'].isna()]
+            cleaned_data = cleaned_data.dropna(subset=['OrderDate'])
+            cleaned_data['OrderDate'] = cleaned_data['OrderDate'].dt.strftime('%Y-%m-%d')
+        except Exception as e:
+            print(f"Error in date conversion: {e}")
+        cleaned_data['OrderID'] = pd.to_numeric(cleaned_data['OrderID'], errors='coerce')
+        cleaned_data['CustomerID'] = pd.to_numeric(cleaned_data['CustomerID'], errors='coerce')
+        cleaned_data['ProductID'] = pd.to_numeric(cleaned_data['ProductID'], errors='coerce')
+        cleaned_data['Quantity'] = pd.to_numeric(cleaned_data['Quantity'], errors='coerce')
+        invalid_numeric = cleaned_data[cleaned_data[['OrderID', 'CustomerID', 'ProductID', 'Quantity']].isna()]
+        cleaned_data = cleaned_data.dropna(subset=['OrderID', 'CustomerID', 'ProductID', 'Quantity'])
+        cleaned_data['OrderID'] = cleaned_data['OrderID'].astype(int)
+        cleaned_data['CustomerID'] = cleaned_data['CustomerID'].astype(int)
+        cleaned_data['ProductID'] = cleaned_data['ProductID'].astype(int)
+        cleaned_data['Quantity'] = cleaned_data['Quantity'].astype(int)
+
+        # Apply CDC: Only keep rows updated after last_processed_timestamp
+        if last_processed_timestamp and isinstance(last_processed_timestamp, datetime):
+            cleaned_data = cleaned_data[cleaned_data['OrderDate'] > last_processed_timestamp]
+
+    elif file_type == "Customers":
+        cleaned_data = df.dropna()
+        removed_nulls = original_data[~original_data.index.isin(cleaned_data.index)]
+        cleaned_data = cleaned_data.drop_duplicates(subset="CustomerID", keep="first")
+        removed_duplicates = original_data[~original_data.index.isin(cleaned_data.index)]
+        cleaned_data['CustomerID'] = pd.to_numeric(cleaned_data['CustomerID'], errors='coerce')
+        invalid_numeric = cleaned_data[cleaned_data['CustomerID'].isna()]
+        cleaned_data = cleaned_data.dropna(subset=['CustomerID'])
+        cleaned_data['CustomerID'] = cleaned_data['CustomerID'].astype(int)
+        cleaned_data['Age'] = pd.to_numeric(cleaned_data['Age'], errors='coerce')
+        invalid_numeric = pd.concat([invalid_numeric, cleaned_data[cleaned_data['Age'].isna()]])
+        cleaned_data = cleaned_data.dropna(subset=['Age'])
+        invalid_age = cleaned_data[cleaned_data['Age'] > 100]
+        cleaned_data = cleaned_data[cleaned_data['Age'] <= 100]
+        invalid_numeric = pd.concat([invalid_numeric, invalid_age])
+
+        # Apply CDC: Only keep rows updated after last_processed_timestamp
+        if last_processed_timestamp and isinstance(last_processed_timestamp, datetime):
+            pass
+
+    else:
+        raise ValueError("Unsupported file type")
+
+    bad_data = pd.concat([removed_nulls, removed_duplicates, invalid_dates, invalid_numeric]).drop_duplicates()
+    cleaned_data.reset_index(drop=True, inplace=True)
+    bad_data.reset_index(drop=True, inplace=True)
+
+    return cleaned_data, bad_data
+
+# Save cleaned and bad data to Azure Data Lake Storage
+def save_to_adls(file_type, cleaned_data, bad_data):
+    cleaned_folder = "Processed/Cleaned"
+    bad_data_folder = "Processed/BadData"
+    os.makedirs(cleaned_folder, exist_ok=True)
+    os.makedirs(bad_data_folder, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')
+    cleaned_blob_name = f"{cleaned_folder}/cleaned_{file_type.lower()}_{timestamp}.csv"
+    bad_data_blob_name = f"{bad_data_folder}/bad_data_{file_type.lower()}_{timestamp}.csv"
+
+    cleaned_csv = cleaned_data.to_csv(index=False).encode('utf-8')
+    bad_data_csv = bad_data.to_csv(index=False).encode('utf-8')
+
+    cleaned_blob_client = blob_service_client.get_blob_client(container=container_name, blob=cleaned_blob_name)
+    cleaned_blob_client.upload_blob(cleaned_csv, overwrite=True)
+
+    bad_data_blob_client = blob_service_client.get_blob_client(container=container_name, blob=bad_data_blob_name)
+    bad_data_blob_client.upload_blob(bad_data_csv, overwrite=True)
+
+    print(f"{file_type} cleaning complete.")
+    print(f"Cleaned data saved to: {cleaned_blob_name}")
+    print(f"Bad data saved to: {bad_data_blob_name}")
+
+# Main execution
+def process_file(file_type, folder_name):
+    try:
+        blob_name, last_processed_timestamp = get_latest_file(folder_name, file_type)
+        cleaned_data, bad_data = clean_data(file_type, blob_name, last_processed_timestamp)
+        save_to_adls(file_type, cleaned_data, bad_data)
+    except Exception as e:
+        print(f"Error processing {file_type} file: {e}")
+
+file_configs = [
+    {"file_type": "Products", "folder_name": "Products"},
+    {"file_type": "Orders", "folder_name": "Orders"},
+    {"file_type": "Customers", "folder_name": "Customers"}
+]
+
+for config in file_configs:
+    process_file(config["file_type"], config["folder_name"])
